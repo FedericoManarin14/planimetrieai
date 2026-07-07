@@ -7,11 +7,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Anthropic from '@anthropic-ai/sdk';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT ?? 8787;
-const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-opus-4-8';
+// Cloud AI via OpenRouter (OpenAI-compatible). One key, many models; default
+// to Gemini Flash — cheap, strong vision, supports structured outputs.
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY ?? '';
+const MODEL = process.env.OPENROUTER_MODEL ?? 'google/gemini-2.5-flash';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'db.json');
 const FREE_PLAN_MAX_PROJECTS = 3;
@@ -179,7 +182,7 @@ app.post('/api/billing/upgrade', (req, res) => {
 
 /* ------------------------------- cloud AI ------------------------------- */
 
-const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+const aiEnabled = Boolean(OPENROUTER_KEY);
 
 const PLAN_REQUEST_SCHEMA = {
   type: 'object',
@@ -220,84 +223,122 @@ const PLAN_REQUEST_SCHEMA = {
 
 function aiUnavailable(res) {
   res.status(503).json({
-    error: 'AI cloud non configurata sul server (manca ANTHROPIC_API_KEY).',
+    error: 'AI cloud non configurata sul server (manca OPENROUTER_API_KEY).',
   });
 }
 
-function extractJson(response) {
-  const text = response.content.find((b) => b.type === 'text')?.text;
-  return text ? JSON.parse(text) : null;
+// Extract JSON from an OpenAI-compatible chat completion. Some models wrap the
+// JSON in ```json fences even under json_schema, so parse defensively.
+function extractJson(completion) {
+  const text = completion?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // fall back to the first {...} block
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
 }
 
+// Call OpenRouter with a JSON-schema-constrained response.
+async function openrouterPlan(messages) {
+  const resp = await fetch(OPENROUTER_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_KEY}`,
+      'Content-Type': 'application/json',
+      'X-Title': 'PlanimetrieAI',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 2048,
+      messages,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'plan_request', strict: true, schema: PLAN_REQUEST_SCHEMA },
+      },
+    }),
+  });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    const err = new Error(`OpenRouter ${resp.status}: ${detail.slice(0, 300)}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return resp.json();
+}
+
+const PROMPT_SYSTEM =
+  'You turn free-form Italian or English home briefs into a structured room program ' +
+  'for a residential floor plan generator. Choose sensible lot dimensions and room areas ' +
+  '(meters, m²) when not specified. Use Italian labels (Soggiorno, Cucina, Camera 1, Bagno...). ' +
+  'This is for a commercial presentation tool, not construction documents. ' +
+  'Reply with ONLY the JSON object required by the schema.';
+
+const FACADE_SYSTEM =
+  'You analyze a photo of a house facade and estimate a plausible room program for a ' +
+  'single-floor presentation model: overall footprint (meters), and a room list with ' +
+  'Italian labels and areas (m²). This is an experimental estimate for a commercial ' +
+  'presentation tool — plausibility over precision. If the photo shows multiple floors, ' +
+  'estimate the ground floor only and mention it in the note. ' +
+  'Reply with ONLY the JSON object required by the schema.';
+
 app.post('/api/prompt-to-plan', async (req, res) => {
-  if (!anthropic) return aiUnavailable(res);
+  if (!aiEnabled) return aiUnavailable(res);
   const { prompt } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'Prompt mancante' });
   }
   try {
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 2048,
-      system:
-        'You turn free-form Italian or English home briefs into a structured room program ' +
-        'for a residential floor plan generator. Choose sensible lot dimensions and room areas ' +
-        '(meters, m²) when not specified. Use Italian labels (Soggiorno, Cucina, Camera 1, Bagno...). ' +
-        'This is for a commercial presentation tool, not construction documents.',
-      messages: [{ role: 'user', content: prompt }],
-      output_config: { format: { type: 'json_schema', schema: PLAN_REQUEST_SCHEMA } },
-    });
-    if (response.stop_reason === 'refusal') {
-      return res.status(422).json({ error: 'Richiesta non interpretabile' });
-    }
-    const data = extractJson(response);
+    const completion = await openrouterPlan([
+      { role: 'system', content: PROMPT_SYSTEM },
+      { role: 'user', content: prompt },
+    ]);
+    const data = extractJson(completion);
     if (!data) return res.status(502).json({ error: 'Risposta AI non valida' });
     res.json(data);
   } catch (err) {
-    console.error('prompt-to-plan error:', err);
+    console.error('prompt-to-plan error:', err.message);
     res.status(502).json({ error: 'Errore del servizio AI' });
   }
 });
 
 app.post('/api/facade-to-plan', async (req, res) => {
-  if (!anthropic) return aiUnavailable(res);
+  if (!aiEnabled) return aiUnavailable(res);
   const { imageBase64, mediaType } = req.body ?? {};
   const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
   if (typeof imageBase64 !== 'string' || !allowed.includes(mediaType)) {
     return res.status(400).json({ error: 'Immagine mancante o formato non supportato' });
   }
   try {
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 2048,
-      system:
-        'You analyze a photo of a house facade and estimate a plausible room program for a ' +
-        'single-floor presentation model: overall footprint (meters), and a room list with ' +
-        'Italian labels and areas (m²). This is an experimental estimate for a commercial ' +
-        'presentation tool — plausibility over precision. If the photo shows multiple floors, ' +
-        'estimate the ground floor only and mention it in the note.',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-            {
-              type: 'text',
-              text: 'Stima il programma stanze del piano terra di questa casa per un modello 3D di presentazione.',
-            },
-          ],
-        },
-      ],
-      output_config: { format: { type: 'json_schema', schema: PLAN_REQUEST_SCHEMA } },
-    });
-    if (response.stop_reason === 'refusal') {
-      return res.status(422).json({ error: 'Immagine non analizzabile' });
-    }
-    const data = extractJson(response);
+    const completion = await openrouterPlan([
+      { role: 'system', content: FACADE_SYSTEM },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Stima il programma stanze del piano terra di questa casa per un modello 3D di presentazione.',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mediaType};base64,${imageBase64}` },
+          },
+        ],
+      },
+    ]);
+    const data = extractJson(completion);
     if (!data) return res.status(502).json({ error: 'Risposta AI non valida' });
     res.json(data);
   } catch (err) {
-    console.error('facade-to-plan error:', err);
+    console.error('facade-to-plan error:', err.message);
     res.status(502).json({ error: 'Errore del servizio AI' });
   }
 });
@@ -305,9 +346,11 @@ app.post('/api/facade-to-plan', async (req, res) => {
 /* --------------------------------- misc --------------------------------- */
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, ai: Boolean(anthropic) });
+  res.json({ ok: true, ai: aiEnabled, model: aiEnabled ? MODEL : null });
 });
 
 app.listen(PORT, () => {
-  console.log(`PlanimetrieAI server on http://localhost:${PORT} (AI: ${anthropic ? 'on' : 'off'})`);
+  console.log(
+    `PlanimetrieAI server on http://localhost:${PORT} (AI: ${aiEnabled ? `on · ${MODEL}` : 'off'})`,
+  );
 });
